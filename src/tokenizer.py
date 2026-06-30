@@ -2,48 +2,55 @@ import regex as re
 
 class Tokenizer:
     def __init__(self):
+        # OpenAI's GPT-2 regex pattern to split text into distinct semantic blocks
         self.pattern = re.compile(r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
-        self.encoder={}
-        self.decoder={}
-        self.merges = {}  # Maps (id1, id2) -> new_id to track merge execution priority
+        self.encoder = {}  # Maps raw Bytes -> Integer Token ID
+        self.decoder = {}  # Maps Integer Token ID -> raw Bytes
+        self.merges = {}   # Maps (id1, id2) -> new_id to keep track of training priority ranks
 
-    # Function to get adjacent pairs of IDs from a list of lists of IDs
     def get_adjacent_pairs_count(self, ids_list):
-        adjacent_pairs={}
+        """Scans sequences of token IDs and returns frequencies of consecutive pairs."""
+        adjacent_pairs = {}
         for ids in ids_list:
             for pair in zip(ids, ids[1:]):
-                adjacent_pairs[pair]=adjacent_pairs.get(pair, 0) + 1
-
+                adjacent_pairs[pair] = adjacent_pairs.get(pair, 0) + 1
         return adjacent_pairs
 
-    def merge_adjacent_pairs(self, ids_list, adjacent_pairs, new_id):
-        new_ids_list=[]
+    def merge_adjacent_pairs(self, ids_list, target_pair, new_id):
+        """Replaces all occurrences of target_pair with a single new_id across the corpus."""
+        new_ids_list = []
         for ids in ids_list:
-            new_ids=[]
-            i=0
+            new_ids = []
+            i = 0
             while i < len(ids):
-                if i < len(ids)-1 and (ids[i], ids[i+1]) == adjacent_pairs:
+                # If we encounter the target pair, compress it into the new ID
+                if i < len(ids) - 1 and (ids[i], ids[i+1]) == target_pair:
                     new_ids.append(new_id)
-                    i+=2
+                    i += 2  # Skip both elements
                 else:
                     new_ids.append(ids[i])
-                    i+=1
+                    i += 1
             new_ids_list.append(new_ids)
-
         return new_ids_list
     
     def train(self, vocab_size, text):        
+        """Trains the tokenizer by iteratively merging the most frequent byte/token pairs."""
+        # Initialize the base vocabulary with the standard 256 structural byte options
         self.encoder = {bytes([i]): i for i in range(256)}
         self.merges = {}
 
+        # Chunk the text using the structural GPT regex rules
         preprocessed_text = self.pattern.findall(text)
-        preprocessed_text = [item.strip() for item in preprocessed_text if item.strip()]
+        
+        # NOTE: We avoid .strip() here because spaces are foundational structures in GPT BPE
+        preprocessed_text = [item for item in preprocessed_text if item]
         words = sorted(set(preprocessed_text))
-        ids_list=[list(chunks.encode('utf-8')) for chunks in words]
+        
+        # Convert character strings into lists of raw byte integers
+        ids_list = [list(chunks.encode('utf-8')) for chunks in words]
 
         current_idx = 256
-        num_merges = vocab_size - 256  # Subtract the initial 256 byte values as utf-8 has 256 unique byte values.
-
+        num_merges = vocab_size - 256
 
         for k in range(num_merges):
             adjacent_pairs = self.get_adjacent_pairs_count(ids_list)
@@ -51,62 +58,52 @@ class Tokenizer:
                 break
                 
             most_frequent_pair = max(adjacent_pairs, key=adjacent_pairs.get)
-            print(f"Iteration {k}: Most frequent pair: {most_frequent_pair}")
+            print(f"Iteration {k}: Most frequent pair: {most_frequent_pair} -> Merged ID: {current_idx}")
 
-            # Keep track of this merge rule and its rank priority
+            # Register the merge priority rule
             self.merges[most_frequent_pair] = current_idx
 
-            # Correctly merge the sequence data
+            # Update the numerical IDs list with our new merged token
             ids_list = self.merge_adjacent_pairs(ids_list, most_frequent_pair, current_idx)
 
-            # Retrieve raw bytes for both halves of the pair
+            # Look up raw byte segments for both components to construct the merged token's bytes
             bytes_part1 = self._get_bytes_for_id(most_frequent_pair[0], self.encoder)
             bytes_part2 = self._get_bytes_for_id(most_frequent_pair[1], self.encoder)
-            
-            # FIX: Concatenate the raw byte sequences together
             byte_piece = bytes_part1 + bytes_part2
                     
-            # Store the new mapping (Bytes -> New ID)
+            # Update the encoder vocabulary map
             self.encoder[byte_piece] = current_idx
             current_idx += 1
             
-        # Rebuild the decoder at the very end of training
+        # Generate the inverse lookup table for decoding
         self.decoder = {v: k for k, v in self.encoder.items()}
     
     def _get_bytes_for_id(self, idx, encoder_dict):
-        # If it's a base byte, we can construct it instantly
+        """Helper to safely fetch or reconstruct raw byte values for any vocabulary ID."""
         if idx < 256:
             return bytes([idx])
-        
-        # Otherwise, look it up dynamically from what we've built
         return next(k for k, v in encoder_dict.items() if v == idx)
     
     def encode(self, text):
-        """
-        Encodes raw incoming string text into token IDs based on learned BPE merges.
-        """
+        """Encodes raw incoming string text into token IDs based on training merge rules."""
         text_chunks = self.pattern.findall(text)
         final_ids = []
 
         for chunk in text_chunks:
-            # Convert text chunk into raw utf-8 byte values
             chunk_ids = list(chunk.encode('utf-8'))
 
             while len(chunk_ids) >= 2:
-                # Find all current pairs inside this isolated text chunk
                 adjacent_pairs = {}
                 for pair in zip(chunk_ids, chunk_ids[1:]):
                     adjacent_pairs[pair] = adjacent_pairs.get(pair, 0) + 1
                 
-                # Out of all available pairs here, select the one that was learned EARLIEST in training.
-                # If a pair wasn't learned during training, give it an infinite rank (ignored).
+                # Prioritize merging pairs that were discovered EARLIEST during training
                 best_pair = min(adjacent_pairs, key=lambda p: self.merges.get(p, float('inf')))
                 
-                # If the best pair is not a valid trained merge, we can no longer compress this chunk
+                # If the best pair was never registered during training, we cannot compress further
                 if best_pair not in self.merges:
                     break
                 
-                # Execute the single merge across the chunk sequence
                 new_id = self.merges[best_pair]
                 new_ids = []
                 i = 0
@@ -117,6 +114,8 @@ class Tokenizer:
                     else:
                         new_ids.append(chunk_ids[i])
                         i += 1
+                
+                # FIX: We only reassign chunk_ids AFTER the inner loop completes fully!
                 chunk_ids = new_ids
 
             final_ids.extend(chunk_ids)
@@ -124,9 +123,7 @@ class Tokenizer:
         return final_ids
     
     def decode(self, ids):
-        """
-        Decodes token IDs back into raw readable string text.
-        """
+        """Decodes token IDs back into a human-readable UTF-8 string."""
         byte_tokens = []
         for idx in ids:
             if idx in self.decoder:
@@ -134,5 +131,4 @@ class Tokenizer:
             else:
                 byte_tokens.append(bytes([idx]))
                 
-        # Combine all parts together and decode into raw UTF-8 string safely
         return b"".join(byte_tokens).decode("utf-8", errors="replace")
